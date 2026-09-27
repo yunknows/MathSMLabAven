@@ -1,0 +1,77 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+test('accounts, authorization, shared content, persistence, feedback and solver configuration',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'yhy-math-test-'));const base='http://localhost:3217';let child;
+ const start=()=>new Promise((resolve,reject)=>{child=spawn(process.execPath,['server.mjs'],{cwd:import.meta.dirname,env:{...process.env,PORT:'3217',APP_ORIGIN:base,DB_PATH:join(dir,'test.sqlite'),OPENAI_API_KEY:''},stdio:['ignore','pipe','pipe']});child.stdout.once('data',resolve);child.once('error',reject);child.once('exit',code=>{if(code)reject(new Error('Server exited '+code));});});
+ const stop=()=>new Promise(resolve=>{child.once('exit',resolve);child.kill();});
+ async function call(path,data,cookie='',method='POST',origin=base){const r=await fetch(base+'/api/'+path,{method:data===undefined?'GET':method,headers:{Origin:origin,'Content-Type':'application/json',Cookie:cookie},body:data===undefined?undefined:JSON.stringify(data)});return {status:r.status,body:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};}
+ try{await start();let r=await call('state');assert.equal(r.body.sections.length,6);assert.equal(r.body.user,null);assert.equal(r.body.aiReady,false);assert(!r.body.posts.some(p=>'answer' in p));
+ assert.equal((await call('admin/posts')).status,401);
+ const admin=await call('login',{username:'yhyAdminQ',password:'yhymath000'});assert.equal(admin.body.user.role,'admin');const ac=admin.cookie;
+ assert.equal((await call('login',{username:'yhyAdminQ',password:'notcorrect'})).status,401);
+ const member=await call('register',{username:'learner',password:'learner123',role:'admin'});assert.equal(member.body.user.role,'member');const mc=member.cookie;
+ assert.equal((await call('register',{username:'YHYADMINQ',password:'learner123'})).status,409);
+ assert.equal((await call('admin/posts',undefined,mc)).status,403);
+ assert.equal((await call('admin/sections',{id:'tricks',title:'Wrong',description:''},mc)).status,403);
+ assert.equal((await call('admin/posts',{section:'tricks',title:'Unauthorized',body:'Bad'},mc)).status,403);
+ assert.equal((await call('admin/sections',{id:'tricks',title:'Wrong',description:''},ac,'POST','https://evil.example')).status,403);
+ const abort=new AbortController();const stream=await fetch(base+'/api/events',{signal:abort.signal});const reader=stream.body.getReader();await reader.read();
+ const post=await call('admin/posts',{section:'tricks',title:'Shared test',body:'Visible to everyone',formula:'2 + 2 = 4'},ac);assert.equal(post.status,200);const id=post.body.id;
+ const event=await reader.read();assert(new TextDecoder().decode(event.value).includes('event: update'));abort.abort();
+ r=await call('state',undefined,mc);assert(r.body.posts.some(p=>p.id===id));
+ assert.equal((await call('admin/posts',{id,section:'tricks',title:'Updated test',body:'New version'},ac)).status,200);
+ await call('admin/sections',{id:'tricks',title:'My Tricks',description:'Updated intro'},ac);assert.equal((await call('state')).body.sections[0].title,'My Tricks');
+ const ex=(await call('state')).body.posts.find(p=>p.section==='exercises'&&p.formula.includes('42'));
+ assert.equal((await call('check',{id:ex.id,answer:'462'},mc)).body.correct,true);
+ assert.equal((await call('check',{id:ex.id,answer:'1'},mc)).body.correct,false);
+ await call('feedback',{body:'Private message'},mc);const other=await call('register',{username:'another',password:'another123'});assert.equal((await call('feedback',undefined,other.cookie)).body.length,0);
+ const fb=(await call('feedback',undefined,ac)).body[0];await call('admin/feedback',{id:fb.id,status:'Resolved',reply:'Thank you'},ac);assert.equal((await call('feedback',undefined,mc)).body[0].reply,'Thank you');
+ assert.equal((await call('solve',{question:'2 + 2'},mc)).status,503);
+ // New account management: privilege boundaries, owner protection, bans, and inbox privacy.
+ const ownerId=admin.body.user.id,memberId=member.body.user.id,otherId=other.body.user.id;
+ assert.equal(admin.body.user.isOwner,true);
+ assert.equal((await call('admin/users',undefined,mc)).status,403);
+ assert.equal((await call('admin/users',{id:memberId,action:'promote'},mc)).status,403);
+ const userList=(await call('admin/users',undefined,ac)).body;assert(userList.every(u=>!('password' in u)));assert.equal(userList[0].id,otherId);
+ for(const action of ['ban','unban','promote','demote','delete'])assert.equal((await call('admin/users',{id:ownerId,action},ac)).status,403);
+ await call('admin/users',{id:memberId,action:'promote'},ac);assert.equal((await call('state',undefined,mc)).body.user.role,'admin');
+ assert.equal((await call('admin/users',{id:otherId,action:'promote'},mc)).status,200);
+ for(const action of ['ban','demote','delete']){
+  assert.equal((await call('admin/users',{id:ownerId,action},mc)).status,403);
+  assert.equal((await call('admin/users',{id:otherId,action},mc)).status,403);
+ }
+ assert.equal((await call('admin/users',{id:otherId,action:'demote'},ac)).status,200);
+ assert.equal((await call('admin/posts',undefined,other.cookie)).status,403);
+ assert.equal((await call('admin/messages',{recipient_id:otherId,body:'A private note'},mc)).status,200);
+ const inbox=(await call('messages',undefined,other.cookie)).body;assert.equal(inbox[0].body,'A private note');assert.equal(inbox[0].sender_name,'learner');
+ assert.equal((await call('messages',undefined,ac)).body.length,0);
+ assert.equal((await call('messages',undefined,mc)).body.length,0);
+ assert.equal((await call('messages/read',{id:inbox[0].id},ac)).status,404);
+ assert.equal((await call('messages/read',{id:inbox[0].id},other.cookie)).status,200);
+ assert.equal((await call('state',undefined,other.cookie)).body.unread,0);
+ assert.equal((await call('admin/messages',{recipient_id:memberId,body:'Not allowed'},other.cookie)).status,403);
+ assert.equal((await call('admin/users',{id:otherId,action:'ban'},mc)).status,200);
+ assert.equal((await call('messages',undefined,other.cookie)).status,401);
+ assert.equal((await call('login',{username:'another',password:'another123'})).status,403);
+ assert.equal((await call('admin/users',{id:otherId,action:'promote'},ac)).status,400);
+ assert.equal((await call('admin/users',{id:otherId,action:'unban'},mc)).status,200);
+ const unbanned=await call('login',{username:'another',password:'another123'});assert.equal(unbanned.status,200);
+ assert.equal((await call('admin/users',{id:memberId,action:'demote'},ac)).status,200);
+ assert.equal((await call('admin/posts',undefined,mc)).status,403);
+ await stop();await start();r=await call('state',undefined,mc);assert.equal(r.body.user.username,'learner');assert(r.body.posts.some(p=>p.title==='Updated test'));assert.equal(r.body.sections[0].title,'My Tricks');
+ await call('admin/posts/'+id,{},ac,'DELETE');assert(!(await call('state')).body.posts.some(p=>p.id===id));
+ await call('logout',{},mc);assert.equal((await call('feedback',undefined,mc)).status,401);
+ assert.equal((await call('messages',undefined,unbanned.cookie)).body.length,1);
+ await call('feedback',{body:'Remove together with my account'},unbanned.cookie);
+ assert.equal((await call('admin/users',{id:otherId,action:'delete'},ac)).status,200);
+ assert.equal((await call('messages',undefined,unbanned.cookie)).status,401);
+ assert.equal((await call('login',{username:'another',password:'another123'})).status,401);
+ assert(!(await call('admin/users',undefined,ac)).body.some(u=>u.id===otherId));
+ assert(!(await call('feedback',undefined,ac)).body.some(f=>f.user_id===otherId));
+ console.log('Verified: live event, shared database, restart persistence, admin permissions, private feedback, logout and AI unavailable state.');
+ }finally{if(child?.exitCode===null)await stop();rmSync(dir,{recursive:true,force:true});}
+});
